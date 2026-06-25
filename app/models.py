@@ -18,6 +18,16 @@ class StudyProfile(Base):
     reviews: Mapped[list["ReviewRecord"]] = relationship(cascade="all, delete-orphan")
 
 
+class User(Base):
+    __tablename__ = "users"
+
+    username: Mapped[str] = mapped_column(String(64), primary_key=True)
+    password_hash: Mapped[str] = mapped_column(String(255))
+    token: Mapped[str | None] = mapped_column(String(128), unique=True, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
 class ReviewRecord(Base):
     __tablename__ = "review_records"
 
