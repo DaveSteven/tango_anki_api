@@ -17,7 +17,6 @@ from .schemas import (
     DailyProgressPayload,
     LoginPayload,
     LoginResponse,
-    MigrationPayload,
     ReviewPayload,
     SettingsPayload,
     StudyStateResponse,
@@ -212,27 +211,6 @@ def logout(user: User = Depends(current_user), db: Session = Depends(get_db)) ->
 @app.get("/api/v1/study-state/me", response_model=StudyStateResponse)
 def get_state(user: User = Depends(current_user), db: Session = Depends(get_db)) -> StudyStateResponse:
     profile = get_or_create_profile(db, user.username)
-    db.commit()
-    return state_response(db, profile)
-
-
-@app.post("/api/v1/study-state/me/migrate", response_model=StudyStateResponse)
-def migrate(
-    payload: MigrationPayload,
-    user: User = Depends(current_user),
-    db: Session = Depends(get_db),
-) -> StudyStateResponse:
-    profile = get_or_create_profile(db, user.username)
-    for card_id, review in payload.reviews.items():
-        existing = db.get(ReviewRecord, (user.username, card_id))
-        if existing is None or (review.lastReviewed or 0) >= (existing.last_reviewed or 0):
-            upsert_review(db, user.username, card_id, review)
-    if payload.daily and (
-        not profile.daily_progress or payload.daily.date >= profile.daily_progress.get("date", "")
-    ):
-        profile.daily_progress = payload.daily.model_dump()
-    if payload.settings:
-        profile.settings = payload.settings.model_dump()
     db.commit()
     return state_response(db, profile)
 

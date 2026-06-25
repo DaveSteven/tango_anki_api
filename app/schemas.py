@@ -25,12 +25,6 @@ class SettingsPayload(BaseModel):
     newPerDay: int = Field(default=20, ge=0, le=999)
 
 
-class MigrationPayload(BaseModel):
-    reviews: dict[str, ReviewPayload] = Field(default_factory=dict)
-    daily: DailyProgressPayload | None = None
-    settings: SettingsPayload | None = None
-
-
 class StudyStateResponse(BaseModel):
     reviews: dict[str, ReviewPayload]
     daily: DailyProgressPayload | None

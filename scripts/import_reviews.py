@@ -7,10 +7,31 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 
 
+def post_json(url: str, payload: dict, token: str | None = None) -> dict:
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    request = Request(url, data=json.dumps(payload).encode(), headers=headers, method="POST")
+    with urlopen(request) as response:
+        return json.load(response)
+
+
+def put_json(url: str, payload: dict, token: str) -> None:
+    request = Request(
+        url,
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+        method="PUT",
+    )
+    with urlopen(request):
+        pass
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("json_file", type=Path)
-    parser.add_argument("--device-id", default="david-local")
+    parser.add_argument("--username", default="david")
+    parser.add_argument("--password", default="214423")
     parser.add_argument("--api-url", default="http://localhost:8002")
     args = parser.parse_args()
 
@@ -18,16 +39,11 @@ def main() -> None:
     if not isinstance(reviews, dict):
         raise ValueError("Review JSON must be an object keyed by card id")
 
-    body = json.dumps({"reviews": reviews}).encode()
-    request = Request(
-        f"{args.api_url.rstrip('/')}/api/v1/study-state/{args.device_id}/migrate",
-        data=body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urlopen(request) as response:
-        result = json.load(response)
-    print(f"Imported {len(result['reviews'])} review records for {args.device_id}")
+    api_url = args.api_url.rstrip("/")
+    session = post_json(f"{api_url}/api/v1/auth/login", {"username": args.username, "password": args.password})
+    for card_id, review in reviews.items():
+        put_json(f"{api_url}/api/v1/study-state/me/reviews/{card_id}", review, session["token"])
+    print(f"Imported {len(reviews)} review records for {args.username}")
 
 
 if __name__ == "__main__":
