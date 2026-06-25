@@ -1,0 +1,33 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: tango_anki_db
+    environment:
+      POSTGRES_DB: tango_anki
+      POSTGRES_USER: tango_anki
+      POSTGRES_PASSWORD: tango_anki
+    ports:
+      - "5433:5432"
+    volumes:
+      - tango_anki_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tango_anki -d tango_anki"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+  api:
+    build: .
+    container_name: tango_anki_api
+    ports:
+      - "8002:8000"
+    environment:
+      DATABASE_URL: postgresql+psycopg://tango_anki:tango_anki@db:5432/tango_anki
+      CORS_ORIGINS: http://localhost:7777,http://127.0.0.1:7777
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  tango_anki_postgres:
