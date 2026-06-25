@@ -42,7 +42,8 @@ PASSWORD_SALT = os.getenv("PASSWORD_SALT", "tango-anki-local-salt")
 @app.on_event("startup")
 def create_tables() -> None:
     Base.metadata.create_all(bind=engine)
-    seed_default_user_and_migrate_legacy_data()
+    migrate_user_id_schema()
+    seed_default_user()
 
 
 def get_db() -> Generator[Session, None, None]:
@@ -68,61 +69,154 @@ def validate_username(username: str) -> str:
     return username
 
 
-def seed_default_user_and_migrate_legacy_data() -> None:
+def migrate_user_id_schema() -> None:
+    default_username = validate_username(DEFAULT_USERNAME).replace("'", "''")
+    legacy_device_id = validate_username(LEGACY_DEVICE_ID).replace("'", "''")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                f"""
+                DO $$
+                BEGIN
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.tables
+                        WHERE table_schema = 'public' AND table_name = 'users'
+                    ) AND NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'id'
+                    ) THEN
+                        CREATE SEQUENCE IF NOT EXISTS users_id_seq;
+                        ALTER TABLE users ADD COLUMN id integer;
+                        ALTER TABLE users ALTER COLUMN id SET DEFAULT nextval('users_id_seq');
+                        UPDATE users SET id = nextval('users_id_seq') WHERE id IS NULL;
+                        PERFORM setval('users_id_seq', GREATEST((SELECT COALESCE(MAX(id), 1) FROM users), 1));
+                        ALTER TABLE users ALTER COLUMN id SET NOT NULL;
+                        ALTER SEQUENCE users_id_seq OWNED BY users.id;
+
+                        IF EXISTS (
+                            SELECT 1 FROM information_schema.table_constraints
+                            WHERE table_schema = 'public'
+                                AND table_name = 'users'
+                                AND constraint_name = 'users_pkey'
+                        ) THEN
+                            ALTER TABLE users DROP CONSTRAINT users_pkey;
+                        END IF;
+
+                        ALTER TABLE users ADD CONSTRAINT users_pkey PRIMARY KEY (id);
+                        IF NOT EXISTS (
+                            SELECT 1 FROM pg_constraint WHERE conname = 'users_username_key'
+                        ) THEN
+                            ALTER TABLE users ADD CONSTRAINT users_username_key UNIQUE (username);
+                        END IF;
+                    END IF;
+
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema = 'public' AND table_name = 'study_profiles' AND column_name = 'device_id'
+                    ) AND NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema = 'public' AND table_name = 'study_profiles' AND column_name = 'user_id'
+                    ) THEN
+                        ALTER TABLE study_profiles ADD COLUMN user_id integer;
+
+                        UPDATE study_profiles profile
+                        SET user_id = users.id
+                        FROM users
+                        WHERE profile.device_id = users.username;
+
+                        UPDATE study_profiles profile
+                        SET user_id = users.id
+                        FROM users
+                        WHERE profile.device_id = '{legacy_device_id}'
+                            AND users.username = '{default_username}'
+                            AND profile.user_id IS NULL;
+
+                        ALTER TABLE study_profiles ALTER COLUMN user_id SET NOT NULL;
+
+                        IF EXISTS (
+                            SELECT 1 FROM information_schema.table_constraints
+                            WHERE table_schema = 'public'
+                                AND table_name = 'review_records'
+                                AND constraint_name = 'review_records_device_id_fkey'
+                        ) THEN
+                            ALTER TABLE review_records DROP CONSTRAINT review_records_device_id_fkey;
+                        END IF;
+
+                        IF EXISTS (
+                            SELECT 1 FROM information_schema.table_constraints
+                            WHERE table_schema = 'public'
+                                AND table_name = 'study_profiles'
+                                AND constraint_name = 'study_profiles_pkey'
+                        ) THEN
+                            ALTER TABLE study_profiles DROP CONSTRAINT study_profiles_pkey;
+                        END IF;
+
+                        ALTER TABLE study_profiles ADD CONSTRAINT study_profiles_pkey PRIMARY KEY (user_id);
+                        ALTER TABLE study_profiles
+                            ADD CONSTRAINT study_profiles_user_id_fkey
+                            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+                    END IF;
+
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema = 'public' AND table_name = 'review_records' AND column_name = 'device_id'
+                    ) AND NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema = 'public' AND table_name = 'review_records' AND column_name = 'user_id'
+                    ) THEN
+                        ALTER TABLE review_records ADD COLUMN user_id integer;
+
+                        UPDATE review_records review
+                        SET user_id = profile.user_id
+                        FROM study_profiles profile
+                        WHERE review.device_id = profile.device_id;
+
+                        ALTER TABLE review_records ALTER COLUMN user_id SET NOT NULL;
+
+                        IF EXISTS (
+                            SELECT 1 FROM information_schema.table_constraints
+                            WHERE table_schema = 'public'
+                                AND table_name = 'review_records'
+                                AND constraint_name = 'review_records_pkey'
+                        ) THEN
+                            ALTER TABLE review_records DROP CONSTRAINT review_records_pkey;
+                        END IF;
+
+                        ALTER TABLE review_records ADD CONSTRAINT review_records_pkey PRIMARY KEY (user_id, card_id);
+                        ALTER TABLE review_records
+                            ADD CONSTRAINT review_records_user_id_fkey
+                            FOREIGN KEY (user_id) REFERENCES study_profiles(user_id) ON DELETE CASCADE;
+                        ALTER TABLE review_records DROP COLUMN device_id;
+                    END IF;
+
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema = 'public' AND table_name = 'study_profiles' AND column_name = 'device_id'
+                    ) AND EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema = 'public' AND table_name = 'study_profiles' AND column_name = 'user_id'
+                    ) THEN
+                        ALTER TABLE study_profiles DROP COLUMN device_id;
+                    END IF;
+                END $$;
+                """
+            )
+        )
+
+
+def seed_default_user() -> None:
     db = SessionLocal()
     try:
         username = validate_username(DEFAULT_USERNAME)
-        user = db.get(User, username)
+        user = db.scalar(select(User).where(User.username == username))
         if user is None:
-            db.add(User(username=username, password_hash=password_hash(DEFAULT_PASSWORD)))
+            user = User(username=username, password_hash=password_hash(DEFAULT_PASSWORD))
+            db.add(user)
             db.flush()
         else:
             user.password_hash = password_hash(DEFAULT_PASSWORD)
-
-        legacy = db.get(StudyProfile, LEGACY_DEVICE_ID)
-        current = db.get(StudyProfile, username)
-        if legacy is not None:
-            if current is None:
-                current = StudyProfile(
-                    device_id=username,
-                    settings=legacy.settings or {"newPerDay": 20},
-                    daily_progress=legacy.daily_progress or {},
-                )
-                db.add(current)
-                db.flush()
-            elif legacy.daily_progress and not current.daily_progress:
-                current.daily_progress = legacy.daily_progress
-            if legacy.settings and not current.settings:
-                current.settings = legacy.settings
-
-            db.execute(
-                text(
-                    """
-                    INSERT INTO review_records (
-                        device_id, card_id, state, due, interval, ease, reps, lapses, step, last_reviewed
-                    )
-                    SELECT
-                        :username, card_id, state, due, interval, ease, reps, lapses, step, last_reviewed
-                    FROM review_records
-                    WHERE device_id = :legacy_device_id
-                    ON CONFLICT (device_id, card_id) DO UPDATE SET
-                        state = EXCLUDED.state,
-                        due = EXCLUDED.due,
-                        interval = EXCLUDED.interval,
-                        ease = EXCLUDED.ease,
-                        reps = EXCLUDED.reps,
-                        lapses = EXCLUDED.lapses,
-                        step = EXCLUDED.step,
-                        last_reviewed = EXCLUDED.last_reviewed
-                    WHERE COALESCE(EXCLUDED.last_reviewed, 0) >= COALESCE(review_records.last_reviewed, 0)
-                    """
-                ),
-                {"username": username, "legacy_device_id": LEGACY_DEVICE_ID},
-            )
-            db.execute(text("DELETE FROM review_records WHERE device_id = :legacy_device_id"), {"legacy_device_id": LEGACY_DEVICE_ID})
-            db.delete(legacy)
-        elif current is None:
-            db.add(StudyProfile(device_id=username, settings={"newPerDay": 20}, daily_progress={}))
+        if db.get(StudyProfile, user.id) is None:
+            db.add(StudyProfile(user_id=user.id, settings={"newPerDay": 20}, daily_progress={}))
         db.commit()
     finally:
         db.close()
@@ -140,11 +234,10 @@ def current_user(
     return user
 
 
-def get_or_create_profile(db: Session, username: str) -> StudyProfile:
-    validate_username(username)
-    profile = db.get(StudyProfile, username)
+def get_or_create_profile(db: Session, user_id: int) -> StudyProfile:
+    profile = db.get(StudyProfile, user_id)
     if profile is None:
-        profile = StudyProfile(device_id=username, settings={"newPerDay": 20}, daily_progress={})
+        profile = StudyProfile(user_id=user_id, settings={"newPerDay": 20}, daily_progress={})
         db.add(profile)
         db.flush()
     return profile
@@ -163,21 +256,21 @@ def to_review_payload(record: ReviewRecord) -> ReviewPayload:
     )
 
 
-def upsert_review(db: Session, device_id: str, card_id: str, payload: ReviewPayload) -> None:
+def upsert_review(db: Session, user_id: int, card_id: str, payload: ReviewPayload) -> None:
     values = payload.model_dump()
     values["last_reviewed"] = values.pop("lastReviewed")
-    insert_values = {"device_id": device_id, "card_id": card_id, **values}
+    insert_values = {"user_id": user_id, "card_id": card_id, **values}
     statement = insert(ReviewRecord).values(**insert_values)
     db.execute(
         statement.on_conflict_do_update(
-            index_elements=[ReviewRecord.device_id, ReviewRecord.card_id],
+            index_elements=[ReviewRecord.user_id, ReviewRecord.card_id],
             set_=values,
         )
     )
 
 
 def state_response(db: Session, profile: StudyProfile) -> StudyStateResponse:
-    records = db.scalars(select(ReviewRecord).where(ReviewRecord.device_id == profile.device_id)).all()
+    records = db.scalars(select(ReviewRecord).where(ReviewRecord.user_id == profile.user_id)).all()
     daily = DailyProgressPayload.model_validate(profile.daily_progress) if profile.daily_progress else None
     return StudyStateResponse(
         reviews={record.card_id: to_review_payload(record) for record in records},
@@ -194,7 +287,7 @@ def health() -> dict[str, str]:
 @app.post("/api/v1/auth/login", response_model=LoginResponse)
 def login(payload: LoginPayload, db: Session = Depends(get_db)) -> LoginResponse:
     username = validate_username(payload.username)
-    user = db.get(User, username)
+    user = db.scalar(select(User).where(User.username == username))
     if user is None or not verify_password(payload.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid username or password")
     user.token = secrets.token_urlsafe(48)
@@ -210,7 +303,7 @@ def logout(user: User = Depends(current_user), db: Session = Depends(get_db)) ->
 
 @app.get("/api/v1/study-state/me", response_model=StudyStateResponse)
 def get_state(user: User = Depends(current_user), db: Session = Depends(get_db)) -> StudyStateResponse:
-    profile = get_or_create_profile(db, user.username)
+    profile = get_or_create_profile(db, user.id)
     db.commit()
     return state_response(db, profile)
 
@@ -222,8 +315,8 @@ def save_review(
     user: User = Depends(current_user),
     db: Session = Depends(get_db),
 ) -> None:
-    get_or_create_profile(db, user.username)
-    upsert_review(db, user.username, card_id, payload)
+    get_or_create_profile(db, user.id)
+    upsert_review(db, user.id, card_id, payload)
     db.commit()
 
 
@@ -233,7 +326,7 @@ def save_daily(
     user: User = Depends(current_user),
     db: Session = Depends(get_db),
 ) -> None:
-    profile = get_or_create_profile(db, user.username)
+    profile = get_or_create_profile(db, user.id)
     profile.daily_progress = payload.model_dump()
     db.commit()
 
@@ -244,6 +337,6 @@ def save_settings(
     user: User = Depends(current_user),
     db: Session = Depends(get_db),
 ) -> None:
-    profile = get_or_create_profile(db, user.username)
+    profile = get_or_create_profile(db, user.id)
     profile.settings = payload.model_dump()
     db.commit()
